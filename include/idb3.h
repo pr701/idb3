@@ -1,8 +1,8 @@
 /*
- *  idb3.h  is a library for accessing IDApro databases.
+ * idb3.h is a library for accessing IDA Pro databases.
  *
  * Author: Willem Hengeveld <itsme@xs4all.nl>
- *
+ * Contributed: Vitaly Maslov <pr701@protonmail.com>
  *
  * Toplevel class: IDBFile, use getsection to get a stream to the desired section,
  * Then create an ID0File, ID1File, NAMFile for that section.
@@ -12,17 +12,152 @@
 #include <sstream>
 #include <vector>
 #include <set>
+#include <unordered_map>
 #include <cassert>
 #include <climits>
 #include <algorithm>
 #include <memory>
-#include "formatter.h"
+#include <cstdio>
+#include <exception>
 
+#ifdef _WIN32
+#undef min
+#undef max
+#endif
+
+#ifdef IDB_ZLIB_COMPRESSION_SUPPORT
+#include <zlib.h>
+#endif
+
+#ifdef _DEBUG
+#define dbgprint(...)   printf(__VA_ARGS__)
+#else
 #define dbgprint(...)
+#endif
+
+// common types
+typedef std::vector<uint8_t> bytes_t;
 
 // a sharedptr, so i can pass an istream around without
 // worrying about who owns it.
 typedef std::shared_ptr<std::istream> stream_ptr;
+typedef std::shared_ptr<bytes_t> bytes_ptr;
+
+// memory stream from memory 
+class imemstream : std::streambuf, public std::istream {
+    std::streampos _size;
+public:
+    imemstream(uint8_t* base, size_t size) : _size(size),
+        std::istream(static_cast<std::streambuf*>(this))
+    {
+        char* p(reinterpret_cast<char*>(base));
+        this->setg(p, p, p + size);
+    }
+protected:
+    std::streampos seekoff(std::streamoff off, std::ios_base::seekdir dir,
+        std::ios_base::openmode which = std::ios_base::in | std::ios_base::out)
+    {
+        if (dir == std::ios_base::cur)
+            setg(eback(), gptr() + off, egptr());
+        else if (dir == std::ios_base::end)
+            setg(eback(), egptr() + off, egptr());
+        else if (dir == std::ios_base::beg)
+            setg(eback(), eback() + off, egptr());
+        return gptr() - eback();
+    }
+    std::streampos seekpos(std::streampos sp, std::ios_base::openmode which = std::ios_base::in | std::ios_base::out)
+    {
+        if (sp < 0 || sp > _size)
+            return -1;
+        return seekoff(sp, std::ios_base::beg, which);
+    }
+};
+
+// simple hex printer
+template<typename T>
+std::string str_hex(const T& value)
+{
+    std::stringstream str;
+    str << std::hex << setfill('0') << std::setw(sizeof(T::value_type) * 2);;
+    for (const auto& val : value)
+    {
+        if (sizeof(T::value_type) == 1)
+            str << static_cast<uint16_t>(val);
+        else
+            str << val;
+    }
+    return str.str();
+}
+
+#ifdef IDB_ZLIB_COMPRESSION_SUPPORT
+
+// zlib rec
+#define CHUNK 16384
+
+int zlib_decompress(stream_ptr& source, uint64_t size, bytes_ptr& dest)
+{
+    int ret;
+    unsigned have;
+    z_stream strm;
+    uint8_t in[CHUNK];
+    uint8_t out[CHUNK];
+    uint64_t position = 0;
+    uint64_t count = 0;
+
+    strm.zalloc = Z_NULL;
+    strm.zfree = Z_NULL;
+    strm.opaque = Z_NULL;
+    strm.avail_in = 0;
+    strm.next_in = Z_NULL;
+
+    ret = inflateInit(&strm);
+    if (ret != Z_OK) return ret;
+
+    do 
+    {
+        if (position >= size)
+            break;
+
+        count = std::min(uint64_t(CHUNK), size - position);
+        source->read(reinterpret_cast<char*>(in), count);
+        position += count;
+
+        strm.next_in = in;
+        strm.avail_in = count;
+        
+        do 
+        {
+            strm.avail_out = CHUNK;
+            strm.next_out = out;
+            ret = inflate(&strm, Z_NO_FLUSH);
+
+            if (ret == Z_STREAM_ERROR)
+            {
+                inflateEnd(&strm);
+                throw std::exception("zlib decompression fail");
+            }
+
+            switch (ret)
+            {
+            case Z_NEED_DICT:
+                ret = Z_DATA_ERROR;
+            case Z_DATA_ERROR:
+            case Z_MEM_ERROR:
+                inflateEnd(&strm);
+                return ret;
+            }
+            have = CHUNK - strm.avail_out;
+            dest->insert(dest->end(), out, out + have);
+
+        } while (strm.avail_out == 0);
+    }
+    while (ret != Z_STREAM_END);
+
+    inflateEnd(&strm);
+    return ret == Z_STREAM_END ? Z_OK : Z_DATA_ERROR;
+}
+
+#endif
 
 // create vector from `n`  invocations of `f`
 template<typename T, typename FN>
@@ -33,7 +168,6 @@ std::vector<T> getvec(int n, FN f)
         v.push_back(f());
     return v;
 }
-
 
 ////////////////////////////////////////////////////////////////////////
 // Sometimes i need to pass backinserter iterators as <first, last> pair
@@ -72,7 +206,7 @@ public:
     {
         auto c = _is->get();
         if (c==-1)
-            throw "EOF";
+            throw std::exception("EOF");
         return (uint8_t)c;
     }
     uint16_t get16le()
@@ -121,14 +255,14 @@ public:
             return get32le();
         else if (_wordsize==8)
             return get64le();
-        throw "unsupported wordsize";
+        throw std::exception("unsupported wordsize");
     }
     std::string getdata(int n)
     {
         std::string str(n, char(0));
         auto m = _is->readsome(&str.front(), n);
         str.resize(m);
-        dbgprint("getdata -> %b\n", str);
+        dbgprint("getdata -> %s\n", str_hex(str).c_str());
         return str;
     }
     void seekg( std::istream::off_type off, std::ios_base::seekdir dir)
@@ -155,70 +289,70 @@ struct EndianTools {
     template<typename P>
     static void set8(P first, P last, uint8_t w)
     {
-        if (last-first < 1)
-            throw "not enough space";
+        if (last - first < 1)
+            throw std::exception("not enough space");
         *first = w;
     }
     template<typename P, typename T>
     static void setbe16(P first, P last, T w)
     {
         P p = first;
-        if (last-p < 2)
-            throw "not enough space";
-        set8(p, last, w>>8);  p += 1;
+        if (last - p < 2)
+            throw std::exception("not enough space");
+        set8(p, last, w >> 8); p += 1;
         set8(p, last, w);
     }
     template<typename P, typename T>
     static void setbe32(P first, P last, T w)
     {
         P p = first;
-        if (last-p < 4)
-            throw "not enough space";
-        setbe16(p, last, w>>16);  p += 2;
+        if (last - p < 4)
+            throw std::exception("not enough space");
+        setbe16(p, last, w >> 16); p += 2;
         setbe16(p, last, w);
     }
     template<typename P, typename T>
     static void setbe64(P first, P last, T w)
     {
         P p = first;
-        if (last-p < 8)
-            throw "not enough space";
-        setbe32(p, last, w>>32);  p += 4;
+        if (last - p < 8)
+            throw std::exception("not enough space");
+        setbe32(p, last, w >> 32); p += 4;
         setbe32(p, last, w);
     }
     template<typename P, typename T>
     static void setle16(P first, P last, T w)
     {
         P p = first;
-        if (last-p < 2)
-            throw "not enough space";
-        set8(p, last, w);  p += 1;
-        set8(p, last, w>>8);
+        if (last - p < 2)
+            throw std::exception("not enough space");
+        set8(p, last, w); p += 1;
+        set8(p, last, w >> 8);
     }
     template<typename P, typename T>
     static void setle32(P first, P last, T w)
     {
         P p = first;
-        if (last-p < 4)
-            throw "not enough space";
-        setle16(p, last, w);      p += 2;
+        if (last - p < 4)
+            throw std::exception("not enough space");
+        setle16(p, last, w); p += 2;
         setle16(p, last, w>>16);
     }
     template<typename P, typename T>
     static void setle64(P first, P last, T w)
     {
         P p = first;
-        if (last-p < 8)
-            throw "not enough space";
-        setle32(p, last, w);        p += 4;
+        if (last - p < 8)
+            throw std::exception("not enough space");
+        setle32(p, last, w); p += 4;
         setle32(p, last, w>>32);
     }
 
     template<typename P>
     static uint8_t get8(P first, P last)
     {
-        if (first>=last)
-            throw "not enough space";
+        if (first >= last)
+            throw std::exception("not enough space");
         return *first;
     }
 
@@ -226,10 +360,10 @@ struct EndianTools {
     static uint16_t getbe16(P first, P last)
     {
         P p = first;
-        if (last-p < 2)
-            throw "not enough space";
-        uint8_t hi =get8(p, last);   p += 1;
-        uint8_t lo =get8(p, last);
+        if (last - p < 2)
+            throw std::exception("not enough space");
+        uint8_t hi = get8(p, last); p += 1;
+        uint8_t lo = get8(p, last);
 
         return (uint16_t(hi)<<8) | lo;
     }
@@ -237,9 +371,9 @@ struct EndianTools {
     static uint32_t getbe32(P first, P last)
     {
         P p = first;
-        if (last-p < 4)
-            throw "not enough space";
-        uint16_t hi =getbe16(p, last);   p += 2;
+        if (last - p < 4)
+            throw std::exception("not enough space");
+        uint16_t hi =getbe16(p, last); p += 2;
         uint16_t lo =getbe16(p, last);
 
         return (uint32_t(hi)<<16) | lo;
@@ -248,9 +382,9 @@ struct EndianTools {
     static uint64_t getbe64(P first, P last)
     {
         P p = first;
-        if (last-p < 8)
-            throw "not enough space";
-        uint32_t hi =getbe32(p, last);   p += 4;
+        if (last - p < 8)
+            throw std::exception("not enough space");
+        uint32_t hi =getbe32(p, last); p += 4;
         uint32_t lo =getbe32(p, last);
 
         return (uint64_t(hi)<<32) | lo;
@@ -259,10 +393,10 @@ struct EndianTools {
     static uint16_t getle16(P first, P last)
     {
         P p = first;
-        if (last-p < 2)
-            throw "not enough space";
-        uint8_t lo =get8(p, last);    p += 1;
-        uint8_t hi =get8(p, last);
+        if (last - p < 2)
+            throw std::exception("not enough space");
+        uint8_t lo = get8(p, last); p += 1;
+        uint8_t hi = get8(p, last);
 
         return (uint16_t(hi)<<8) | lo;
     }
@@ -270,10 +404,10 @@ struct EndianTools {
     static uint32_t getle32(P first, P last)
     {
         P p = first;
-        if (last-p < 4)
-            throw "not enough space";
-        uint16_t lo =getle16(p, last);   p += 2;
-        uint16_t hi =getle16(p, last);
+        if (last - p < 4)
+            throw std::exception("not enough space");
+        uint16_t lo = getle16(p, last); p += 2;
+        uint16_t hi = getle16(p, last);
 
         return (uint32_t(hi)<<16) | lo;
     }
@@ -281,9 +415,9 @@ struct EndianTools {
     static uint64_t getle64(P first, P last)
     {
         P p = first;
-        if (last-p < 8)
-            throw "not enough space";
-        uint32_t lo =getle32(p, last);   p += 4;
+        if (last - p < 8)
+            throw std::exception("not enough space");
+        uint32_t lo =getle32(p, last); p += 4;
         uint32_t hi =getle32(p, last);
 
         return (uint64_t(hi)<<32) | lo;
@@ -368,6 +502,7 @@ protected:
         _curpos+=1;
         return r;
     }
+    friend class sectionstream;
 };
 // istream restricted to a section of a seakable stream
 class sectionstream : public std::istream {
@@ -393,11 +528,12 @@ class IDBFile {
     int _fileversion;
     std::vector<uint64_t> _offsets;
     std::vector<uint32_t> _checksums;
+    std::unordered_map<int, bytes_ptr> _buffer;
 public:
     enum {
-MAGIC_IDA2 = 0x32414449,
-MAGIC_IDA1 = 0x31414449,
-MAGIC_IDA0 = 0x30414449,
+        MAGIC_IDA2 = 0x32414449,
+        MAGIC_IDA1 = 0x31414449,
+        MAGIC_IDA0 = 0x30414449,
     };
     IDBFile(stream_ptr is)
         : _is(is), _magic(0), _fileversion(-1)
@@ -454,9 +590,9 @@ MAGIC_IDA0 = 0x30414449,
     }
     void dump()
     {
-        print("IDB v%d, m=%08x\n", _fileversion, _magic);
+        printf("IDB v%d, m=%08x\n", _fileversion, _magic);
         for (unsigned int i=0 ; i<std::max(_offsets.size(), _checksums.size()) ; i++)
-            print("%d: %10llx %08x\n", i, i<_offsets.size() ? _offsets[i] : -1, i<_checksums.size() ? _checksums[i] : -1);
+            printf("%d: %10llx %08x\n", i, i<_offsets.size() ? _offsets[i] : -1, i<_checksums.size() ? _checksums[i] : -1);
     }
     auto getinfo(int i)
     {
@@ -472,9 +608,45 @@ MAGIC_IDA0 = 0x30414449,
     stream_ptr getsection(int i)
     {
         auto info = getinfo(i);
-        if (std::get<0>(info))
-            throw "compression not supported";
-        return std::make_shared<sectionstream>(_is, std::get<1>(info), std::get<2>(info));
+
+        uint8_t comp = std::get<0>(info);
+        uint64_t off = std::get<1>(info);
+        uint64_t size = std::get<2>(info);
+
+        if (comp == 2)
+        {
+#ifdef IDB_ZLIB_COMPRESSION_SUPPORT
+            auto buffer = get_buffer(i);
+
+            _is->seekg(off, ios::beg);
+            if (zlib_decompress(_is, size, buffer) != Z_OK)
+                throw std::exception("decompression fail");
+
+            return std::make_shared<imemstream>(buffer->data(), buffer->size());
+#else
+            throw std::exception("compression not supported");
+#endif
+        }
+        else if (comp == 0)
+        {
+            return std::make_shared<sectionstream>(_is, off, size);
+        }
+        else
+            throw std::exception("unsupported section encoding");
+    }
+
+    // Flushes the uncompressed section buffers 
+    void flush()
+    {
+        for (auto buf : _buffer)
+            buf.second->clear();
+    }
+private:
+    bytes_ptr get_buffer(int i)
+    {
+        if (_buffer.find(i) == _buffer.end())
+            _buffer[i] = std::make_shared<bytes_t>();
+        return _buffer[i];
     }
 };
 
@@ -597,9 +769,11 @@ public:
     void dump()
     {
         if (_preceeding)
-            print("prec = %05x\n", _preceeding);
+            printf("prec = %05x\n", _preceeding);
         for (unsigned int i=0 ; i<_index.size() ; i++)
-            print("%-b = %-b\n", getkey(i), getval(i));
+            printf("%s = %s\n",
+                str_hex(getkey(i)).c_str(),
+                str_hex(getval(i)).c_str());
     }
 
     void readindex()
@@ -622,7 +796,7 @@ public:
             key.resize(klen+ent.indent);
             _is->read(&key[ent.indent], klen);
 
-            dbgprint("key i=%d, l=%d -> %b\n", ent.indent, klen, key);
+            dbgprint("key i=%d, l=%d -> %s\n", ent.indent, klen, str_hex(key).c_str());
             _keys.push_back(key);
         }
     }
@@ -631,12 +805,13 @@ public:
     uint32_t getpage(int i) const
     {
         if (!isindex())
-            throw "getpage called on leaf";
-        if (i<0)
+            throw std::exception("getpage called on leaf");
+        if (i < 0)
             return _preceeding;
-        if (i>=_index.size()) {
-            print("#%06x i=%d, max=%d\n", _nr, i, _index.size());
-            throw "page: i too large";
+        if (i >= _index.size())
+        {
+            printf("#%06x i=%d, max=%d\n", _nr, i, _index.size());
+            throw std::exception("page: i too large");
         }
         return _index[i].pagenr;
     }
@@ -645,7 +820,8 @@ public:
     std::string getkey(int i)
     {
         auto& ent = getent(i);
-        if (isindex()) {
+        if (isindex())
+        {
             _is->seekg(ent.recofs);
             auto s = makehelper(_is);
             int klen = s.get16le();
@@ -657,7 +833,7 @@ public:
             dbgprint("leafkey(%d)\n", i);
             return _keys[i];
         }
-        throw "not a leaf of index";
+        throw std::exception("not a leaf of index");
     }
     // get value for the item at position `i`
     std::string getval(int i)
@@ -673,9 +849,10 @@ public:
         return s.getdata(vlen);
     }
 
-    Entry& getent(int i) {
-        if (i<0 || i>=_index.size())
-            throw "invalid key index";
+    Entry& getent(int i) 
+    {
+        if (i < 0 || i >= _index.size())
+            throw std::exception("invalid key index");
 
         return _index[i];
     }
@@ -764,7 +941,11 @@ public:
         void dump() const {
             std::stringstream x;
             for (auto& ent : _stack)
-                x << stringformat(" %05x:%d", ent.page->nr(), ent.index);
+            {
+                char buf[24] = { 0 };
+                snprintf(buf, sizeof(buf), " %05x:%d", ent.page->nr(), ent.index);
+                x << buf;
+            }
             std::cout << x.str() << std::endl;
         }
     public:
@@ -780,7 +961,7 @@ public:
         void next()
         {
             if (eof())
-                throw "cursor:EOF";
+                throw std::exception("cursor:EOF");
             auto ent = _stack.back(); _stack.pop_back();
             if (ent.page->isleaf()) {
                 // from leaf move towards root
@@ -809,7 +990,7 @@ public:
         void prev()
         {
             if (eof())
-                throw "cursor:EOF";
+                throw std::exception("cursor:EOF");
             auto ent = _stack.back(); _stack.pop_back();
             ent.index--;
             if (ent.page->isleaf()) {
@@ -843,14 +1024,14 @@ public:
         auto getkey() const
         {
             if (eof())
-                throw "cursor:EOF";
+                throw std::exception("cursor:EOF");
             auto ent = _stack.back();
             return ent.page->getkey(ent.index);
         }
         auto getval() const
         {
             if (eof())
-                throw "cursor:EOF";
+                throw std::exception("cursor:EOF");
             auto ent = _stack.back();
             return ent.page->getval(ent.index);
         }
@@ -878,7 +1059,7 @@ public:
 
     void dump()
     {
-        print("btree v%02d ff=%d, pg=%d, root=%05x, #recs=%d #pgs=%d\n",
+        printf("btree v%02d ff=%d, pg=%d, root=%05x, #recs=%d #pgs=%d\n",
                 version(), _firstfree, _pagesize, _firstindex, _reccount, _pagecount);
 
         dumptree(_firstindex);
@@ -1034,7 +1215,7 @@ public:
             dbgprint("@%04x: lf ent16 %+4d %04x\n", (int)_is->tellg(), ent.indent, ent.recofs);
             return ent;
         }
-        throw "page not a index or leaf";
+        throw std::exception("page not a index or leaf");
     }
 
 };
@@ -1071,14 +1252,16 @@ public:
     virtual Entry readent()
     {
         auto s = makehelper(_is);
-        if (isindex()) {
+        if (isindex())
+        {
             Entry ent;
             ent.pagenr = s.get32le();
             ent.recofs = s.get16le();
             dbgprint("@%04x: ix ent20 %08x %04x\n", (int)_is->tellg(), ent.pagenr, ent.recofs);
             return ent;
         }
-        else if (isleaf()) {
+        else if (isleaf())
+        {
             Entry ent;
             ent.indent = s.get16le();
             /*ent.unknown = */s.get16le();
@@ -1087,7 +1270,7 @@ public:
             dbgprint("@%04x: lf ent20 %+4d %04x\n", (int)_is->tellg(), ent.indent, ent.recofs);
             return ent;
         }
-        throw "page not a index or leaf";
+        throw std::exception("page not a index or leaf");
     }
 
 };
@@ -1111,19 +1294,23 @@ inline std::unique_ptr<BtreeBase> MakeBTree(stream_ptr  is)
     char data[64];
     is->read(data, 64);
 
-    dbgprint("mkbt: %b\n", std::string(data, data+64));
+    dbgprint("mkbt: %s\n", str_hex(std::string(data, data+64)).c_str());
 
-    if (std::equal(data+13, data+13+25, "B-tree v 1.5 (C) Pol 1990")) {
+    if (std::equal(data+13, data+13+25, "B-tree v 1.5 (C) Pol 1990"))
+    {
         bt = std::make_unique<Btree15>(is);
     }
-    else if (std::equal(data+19, data+19+25, "B-tree v 1.6 (C) Pol 1990")) {
+    else if (std::equal(data+19, data+19+25, "B-tree v 1.6 (C) Pol 1990"))
+    {
         bt = std::make_unique<Btree16>(is);
     }
-    else if (std::equal(data+19, data+19+9, "B-tree v2")) {
+    else if (std::equal(data+19, data+19+9, "B-tree v2"))
+    {
         bt = std::make_unique<Btree20>(is);
     }
-    else {
-        throw "unknown btree version";
+    else 
+    {
+        throw std::exception("unknown btree version");
     }
 
     bt->readheader();
@@ -1138,9 +1325,7 @@ class NodeKeys {
 public:
     NodeKeys(int wordsize)
         : _w(wordsize)
-    {
-    }
-
+    {}
 
     template<typename P>
     void setwordle(P first, P last, uint64_t w)
@@ -1161,54 +1346,54 @@ public:
     template<typename P>
     int make_name_key(P first, P last, uint64_t id)
     {
-        if (last-first<1+_w)
-            throw "not enough space";
+        if (last - first < 1 + _w)
+            throw std::exception("not enough space");
         P p = first;
         *p++ = 'N';
         setwordbe(p, last, id); p += _w;
 
-        return p-first;
+        return p - first;
     }
     template<typename P>
     int make_name_key(P first, P last, const std::string& name)
     {
-        if (last-first<1+name.size())
-            throw "not enough space";
+        if (last - first < 1 + name.size())
+            throw std::exception("not enough space");
         P p = first;
         *p++ = 'N';
         std::copy(name.begin(), name.end(), p);
         p += name.size();
 
-        return p-first;
+        return p - first;
     }
 
     template<typename P>
     int make_node_key(P first, P last, uint64_t nodeid)
     {
-        if (last-first<1+_w)
-            throw "not enough space";
+        if (last - first < 1 + _w)
+            throw std::exception("not enough space");
         P p = first;
         *p++ = '.';
         setwordbe(p, last, nodeid); p += _w;
 
-        return p-first;
+        return p - first;
     }
     template<typename P>
     int make_node_key(P first, P last, uint64_t nodeid, char tag)
     {
-        if (last-first<2+_w)
-            throw "not enough space";
+        if (last - first < 2 + _w)
+            throw std::exception("not enough space");
         P p = first;
         *p++ = '.';
         setwordbe(p, last, nodeid); p += _w;
         *p++ = tag;
-        return p-first;
+        return p - first;
     }
     template<typename P>
     int make_node_key(P first, P last, uint64_t nodeid, char tag, const std::string& hashkey)
     {
-        if (last-first<2+_w+hashkey.size())
-            throw "not enough space";
+        if (last - first < 2 + _w + hashkey.size())
+            throw std::exception("not enough space");
         P p = first;
         *p++ = '.';
         setwordbe(p, last, nodeid); p += _w;
@@ -1216,20 +1401,20 @@ public:
         std::copy(hashkey.begin(), hashkey.end(), p);
         p += hashkey.size();
 
-        return p-first;
+        return p - first;
     }
     template<typename P, typename T>
     int make_node_key(P first, P last, uint64_t nodeid, char tag, T index)
     {
-        if (last-first<2+2*_w)
-            throw "not enough space";
+        if (last - first < 2 + 2 * _w)
+            throw std::exception("not enough space");
         P p = first;
         *p++ = '.';
         setwordbe(p, last, nodeid); p += _w;
         *p++ = tag;
         setwordbe(p, last, index); p += _w;
 
-        return p-first;
+        return p - first;
     }
 
     template<typename V>
@@ -1281,7 +1466,8 @@ public:
 struct NodeValues {
     static uint64_t getuint(const std::string& str)
     {
-        switch(str.size()) {
+        switch(str.size())
+        {
             case 1:
                 return EndianTools::get8(str.begin(), str.end());
             case 2:
@@ -1292,11 +1478,12 @@ struct NodeValues {
                 return EndianTools::getle64(str.begin(), str.end());
 
         }
-        throw "unsupported int type";
+        throw std::exception("unsupported int type");
     }
     static uint64_t getuintbe(const std::string& str)
     {
-        switch(str.size()) {
+        switch(str.size())
+        {
             case 1:
                 return EndianTools::get8(str.begin(), str.end());
             case 2:
@@ -1307,7 +1494,7 @@ struct NodeValues {
                 return EndianTools::getbe64(str.begin(), str.end());
 
         }
-        throw "unsupported int type";
+        throw std::exception("unsupported int type");
     }
     static int64_t getint(const std::string& str)
     {
@@ -1483,9 +1670,9 @@ public:
 // basically this is the data for the idc GetFlags(ea)  function.
 class ID1File {
     struct segment {
-        uint32_t start_ea;
-        uint32_t end_ea;
-        uint32_t id1ofs;
+        uint64_t start_ea;
+        uint64_t end_ea;
+        uint64_t id1ofs;
     };
     typedef std::vector<segment> segmentlist_t;
     segmentlist_t _segments;
@@ -1500,7 +1687,7 @@ private:
         auto s = makehelper(_is, _wordsize);
         s.seekg(0);
         uint32_t magic = s.get32le();
-        if ((magic&0xFFF0FFFF)==0x306156) { // Va0 .. Va4
+        if ((magic & 0xFFF0FFFF) == 0x306156) { // Va0 .. Va4
             uint16_t nsegments = s.get16le();
             uint16_t npages    = s.get16le();
             (void)npages; // value not used
@@ -1520,9 +1707,9 @@ private:
             (void)unk1; (void)unk2;  (void)npages;  // values not used
 
             _segments.resize(nsegments);
-            uint32_t ofs= 0x2000;
+            uint64_t ofs = 0x2000;
             for (unsigned i=0 ; i<nsegments ; i++) {
-                auto &seg= _segments[i];
+                auto &seg = _segments[i];
                 seg.start_ea = s.getword();
                 seg.end_ea   = s.getword();
                 seg.id1ofs= ofs;
@@ -1530,8 +1717,9 @@ private:
                 ofs += 4*(seg.end_ea-seg.start_ea);
             }
         }
-        else {
-            throw "invalid id1";
+        else
+        {
+            throw std::exception("invalid id1");
         }
     }
     segmentlist_t::const_iterator find_segment(uint64_t ea) const
@@ -1559,9 +1747,12 @@ public:
     }
     void dump_info()
     {
-        print("id1: %d segments\n", _segments.size());
+        printf("id1: %d segments\n", _segments.size());
         for (unsigned i=0 ; i<_segments.size() ; i++)
-            print("  %08x-%08x @ %08x\n", _segments[i].start_ea, _segments[i].end_ea, _segments[i].id1ofs);
+            if (_wordsize == 8)
+                printf("  %16x-%16x @ %16x\n", _segments[i].start_ea, _segments[i].end_ea, _segments[i].id1ofs);
+            else
+                printf("  %08x-%08x @ %16x\n", _segments[i].start_ea, _segments[i].end_ea, _segments[i].id1ofs);
     }
 
     uint32_t GetFlags(uint64_t ea) const
@@ -1630,7 +1821,6 @@ public:
         else
             _wordsize = 4;
 
-
         open();
     }
 
@@ -1640,21 +1830,23 @@ public:
         s.seekg(0);
         uint32_t magic = s.get32le();
 
-        if ((magic&0xFFF0FFFF)==0x306156) { // Va0 .. Va4
+        if ((magic & 0xFFF0FFFF) == 0x306156)   // Va0 .. Va4
+        { 
             uint16_t npages = s.get16le();  // nr of chunks
             uint16_t eof = s.get16le();
             uint64_t unknown = s.getword();
-            (void)npages; (void)eof; // value not used
+            (void)npages; (void)eof;        // value not used
 
-            _nnames = s.getword();  // nr of names
-            _listofs = s.getword(); // page size
+            _nnames = s.getword();          // nr of names
+            _listofs = s.getword();         // page size
 
             dbgprint("nam: np=%d, eof=%d, nn=%d, ofs=%08x\n",
                     npages, eof, _nnames, _listofs);
             if (unknown)
-                print("!! nam.unknown=%08x\n", unknown);
+                printf("!! nam.unknown=%I64x\n", unknown);
         }
-        else if (magic==0x2a4156) {
+        else if (magic == 0x2a4156)
+        {
             uint32_t unk1 = s.get32le();    // 3
             uint32_t npages = s.get32le();  // nr of chunks
             uint32_t unk2 = s.get32le();    // 0x800
@@ -1668,8 +1860,9 @@ public:
             dbgprint("nam: np=%d, eof=%d, nn=%d, ofs=%08x\n",
                     npages, eof, _nnames, _listofs);
         }
-        else {
-            throw "invalid NAM";
+        else
+        {
+            throw std::exception("invalid NAM");
         }
 
         if (_wordsize==8)
@@ -1706,7 +1899,8 @@ public:
         if (_namedoffsets.empty())
             return BADADDR;
         auto i= std::upper_bound(_namedoffsets.begin(), _namedoffsets.end(), ea);
-        if (i==_namedoffsets.begin()) {
+        if (i==_namedoffsets.begin())
+        {
             // address before first: return first named item
             return *i;
         }
@@ -1755,10 +1949,10 @@ class Unpacker : public BaseUnpacker {
      */
     uint16_t next16()
     {
-        if (_p>=_last)  throw "unpack: no data";
+        if (_p>=_last) throw std::exception("unpack: no data");
         uint8_t byte = *_p++;
         if (byte==0xff) {
-            if (_p+2>_last)  throw "unpack: no data";
+            if (_p+2>_last)  throw std::exception("unpack: no data");
             uint16_t value = EndianTools::getbe16(_p, _last);
             _p += 2;
             return value;
