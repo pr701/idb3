@@ -9,9 +9,9 @@ The header file `idb3.h` contains a library for reading from IDA Pro databases.
 
 [File format description](IDB-FORMAT.md)
 
-## Using
+## Library
 
-### Library types
+### Types
 
 #### IDBFile
 
@@ -94,6 +94,10 @@ Methods
 	* return the key pointed to by the cursor
  * `std::string getval()`
 	* return the value pointed to by the cursor
+
+### Options
+
+Define `IDB_ZLIB_COMPRESSION_SUPPORT` to enable support compressed databases (requires `zlib` library).
 
 ### Example
 
