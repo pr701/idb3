@@ -97,7 +97,7 @@ Methods
 
 ### Example
 
-```с++
+```c++
 #include <idb3.hpp>
 
 IDBFile idb(std::make_shared<std::ifstream>("database.i64", ios::binary));
