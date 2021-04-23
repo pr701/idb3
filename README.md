@@ -98,6 +98,8 @@ Methods
 ### Example
 
 ```с++
+#include <idb3.hpp>
+
 IDBFile idb(std::make_shared<std::ifstream>("database.i64", ios::binary));
 ID0File id0(idb, idb.getsection(ID0File::INDEX));
 
@@ -122,7 +124,9 @@ std::cout << "IDA Version:" << '\t' << version << "[" << str_version << "]" << s
 
 The idb3 library was written by Willem Hengeveld <itsme@xs4all.nl>, and uses in [idbutil](https://github.com/nlitsme/idbutil) project. It is distributed under the MIT License.
 
+## Third party
 
+Using the [zlib library](https://zlib.net) for compressed databases.
 
 
 
