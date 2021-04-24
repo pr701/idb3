@@ -108,8 +108,8 @@ int zlib_decompress(stream_ptr& source, uint64_t size, bytes_ptr& dest)
     z_stream strm;
     uint8_t in[CHUNK];
     uint8_t out[CHUNK];
+    uint32_t count = 0;
     uint64_t position = 0;
-    uint64_t count = 0;
 
     strm.zalloc = Z_NULL;
     strm.zfree = Z_NULL;
@@ -125,7 +125,7 @@ int zlib_decompress(stream_ptr& source, uint64_t size, bytes_ptr& dest)
         if (position >= size)
             break;
 
-        count = std::min(uint64_t(CHUNK), size - position);
+        count = static_cast<uint32_t>(std::min(uint64_t(CHUNK), size - position));
         source->read(reinterpret_cast<char*>(in), count);
         position += count;
 
@@ -625,7 +625,7 @@ public:
 #ifdef IDB_ZLIB_COMPRESSION_SUPPORT
             auto buffer = get_buffer(i);
 
-            _is->seekg(off, ios::beg);
+            _is->seekg(off, std::ios::beg);
             if (zlib_decompress(_is, size, buffer) != Z_OK)
                 throw std::exception("decompression fail");
 
@@ -1864,7 +1864,7 @@ public:
             _listofs = 0x2000;
             _nnames = s.getword();  // nr of names
 
-            dbgprint("nam: np=%d, eof=%d, nn=%d, ofs=%08x\n",
+            dbgprint("nam: np=%d, eof=%d, nn=%d, ofs=%16x\n",
                     npages, eof, _nnames, _listofs);
         }
         else
