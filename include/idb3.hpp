@@ -26,6 +26,7 @@
 #include <memory>
 #include <cstdio>
 #include <exception>
+#include <iomanip>
 
 #ifdef _WIN32
 #undef min
@@ -85,7 +86,7 @@ template<typename T>
 std::string str_hex(const T& value)
 {
     std::stringstream str;
-    str << std::hex << setfill('0') << std::setw(sizeof(T::value_type) * 2);;
+    str << std::hex << std::setfill('0') << std::setw(sizeof(T::value_type) * 2);;
     for (const auto& val : value)
     {
         if (sizeof(T::value_type) == 1)
